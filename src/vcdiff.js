@@ -33,6 +33,18 @@ export const ADDRESS_MODES = DEFAULT_NEAR + DEFAULT_SAME + 2; // 9
 export const MAX_OUTPUT_BYTES = 512 * 1024;
 export const MAX_WINDOWS = 8;
 
+// Root-origin label kinds recorded per output byte when options.provenance
+// is enabled. Every output byte is traced back to the bytes that first
+// materialised it: literal ADD data, a RUN byte, or the source dictionary.
+// COPY instructions never create new roots — they propagate the labels of
+// the bytes they read (source segment, prior windows, or the current
+// window's already-generated output).
+export const ORIGIN_ADD = 1;
+export const ORIGIN_RUN = 2;
+export const ORIGIN_SOURCE_DICT = 3;
+
+export const ORIGIN_KIND_NAMES = ['NONE', 'ADD', 'RUN', 'SOURCE_DICT'];
+
 export class VcdiffError extends Error {
   constructor(code, message, offset = null) {
     super(message);
@@ -247,6 +259,19 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
   const output = new Uint8Array(maxOutput);
   let outputLen = 0;
   const windows = [];
+
+  // Optional per-byte root-origin labels, parallel to `output`. Allocated
+  // only when requested so plain decodes keep their original cost.
+  //   provKind[p]   ORIGIN_* kind of the root that first produced output[p]
+  //   provOrigin[p] position inside the root space (raw delta offset for
+  //                 ADD/RUN roots, dictionary offset for SOURCE_DICT roots)
+  //   provInst[p]   raw offset of the instruction that first produced the
+  //                 byte (ADD/RUN code offset, or the earliest COPY that
+  //                 brought a dictionary byte into the output)
+  const trackProvenance = options.provenance === true;
+  const provKind = trackProvenance ? new Uint8Array(maxOutput) : null;
+  const provOrigin = trackProvenance ? new Uint32Array(maxOutput) : null;
+  const provInst = trackProvenance ? new Uint32Array(maxOutput) : null;
 
   // --- Windows ------------------------------------------------------------
   while (r.pos < r.end) {
@@ -475,9 +500,17 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
             codeOffset,
           );
         }
+        const addDataOffset = dcur.pos;
         const addData = delta.slice(dcur.pos, dcur.pos + size);
         dcur.pos += size;
-        output.set(addData, windowOutputStart + generated);
+        const addBase = windowOutputStart + generated;
+        output.set(addData, addBase);
+        if (provKind) {
+          // Root: the literal bytes in the delta's data section.
+          provKind.fill(ORIGIN_ADD, addBase, addBase + size);
+          provInst.fill(codeOffset, addBase, addBase + size);
+          for (let i = 0; i < size; i++) provOrigin[addBase + i] = addDataOffset + i;
+        }
         generated += size;
         instructions.push({
           seq: order,
@@ -495,8 +528,16 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
             codeOffset,
           );
         }
+        const runByteOffset = dcur.pos;
         const runByte = dcur.byte();
-        output.fill(runByte, windowOutputStart + generated, windowOutputStart + generated + size);
+        const runBase = windowOutputStart + generated;
+        output.fill(runByte, runBase, runBase + size);
+        if (provKind) {
+          // Root: the single repeated byte in the delta's data section.
+          provKind.fill(ORIGIN_RUN, runBase, runBase + size);
+          provOrigin.fill(runByteOffset, runBase, runBase + size);
+          provInst.fill(codeOffset, runBase, runBase + size);
+        }
         generated += size;
         instructions.push({
           seq: order,
@@ -524,9 +565,27 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
         // segment or has already been generated in this target window.
         for (let i = 0; i < size; i++) {
           const u = address + i;
+          const outPos = windowOutputStart + generated;
           let value;
           if (u < sourceLength) {
             value = source[u];
+            if (provKind) {
+              if (sourceKind === 'TARGET') {
+                // Prior-window output byte: inherit the root label that was
+                // computed when that byte was first generated. The later
+                // COPY's own position must not become the root.
+                const srcPos = sourcePosition + u;
+                provKind[outPos] = provKind[srcPos];
+                provOrigin[outPos] = provOrigin[srcPos];
+                provInst[outPos] = provInst[srcPos];
+              } else {
+                // Dictionary byte entering the output for the first time
+                // along this path: this COPY is its producing instruction.
+                provKind[outPos] = ORIGIN_SOURCE_DICT;
+                provOrigin[outPos] = sourcePosition + u;
+                provInst[outPos] = codeOffset;
+              }
+            }
           } else {
             const targetIndex = u - sourceLength;
             if (targetIndex < 0 || targetIndex >= generated) {
@@ -537,9 +596,17 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
                 codeOffset,
               );
             }
-            value = output[windowOutputStart + targetIndex];
+            const srcPos = windowOutputStart + targetIndex;
+            value = output[srcPos];
+            if (provKind) {
+              // Current-window byte (possibly written by this very COPY in a
+              // self-overlap): inherit its already-computed root label.
+              provKind[outPos] = provKind[srcPos];
+              provOrigin[outPos] = provOrigin[srcPos];
+              provInst[outPos] = provInst[srcPos];
+            }
           }
-          output[windowOutputStart + generated] = value;
+          output[outPos] = value;
           generated += 1;
         }
         instructions.push({
@@ -636,10 +703,97 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
     r.pos = deltaEnd;
   }
 
-  return {
+  const result = {
     output: output.slice(0, outputLen),
     length: outputLen,
     windows,
     truncated: false,
   };
+  if (provKind) {
+    result.provenance = {
+      kind: provKind.slice(0, outputLen),
+      origin: provOrigin.slice(0, outputLen),
+      inst: provInst.slice(0, outputLen),
+    };
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Root-origin tracing over a finished decode.
+// ---------------------------------------------------------------------------
+
+// Collapses the per-byte provenance labels of the final output range
+// [start, start + length) into consecutive root segments. Adjacent bytes
+// merge while they share the same root kind, the same producing instruction
+// and contiguous root positions (RUN roots repeat a single position).
+// Every segment reports:
+//   outputStart/outputEnd  range in the final decoded output
+//   kind                   'ADD' | 'RUN' | 'SOURCE_DICT'
+//   originStart/originEnd  byte range inside the root space (raw delta
+//                          offsets for ADD/RUN, dictionary offsets for
+//                          SOURCE_DICT)
+//   instOffset             raw delta offset of the instruction that first
+//                          produced these bytes (never a later COPY)
+export function collectRootSegments(provenance, start, length) {
+  if (
+    !provenance ||
+    !(provenance.kind instanceof Uint8Array) ||
+    !(provenance.origin instanceof Uint32Array) ||
+    !(provenance.inst instanceof Uint32Array)
+  ) {
+    throw new VcdiffError('BAD_INPUT', 'provenance labels are required to trace a range');
+  }
+  const total = provenance.kind.length;
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(length) ||
+    start < 0 ||
+    length < 1 ||
+    start > total ||
+    length > total - start
+  ) {
+    throw new VcdiffError(
+      'TRACE_RANGE',
+      `trace range [${start}, +${length}) lies outside the ${total} bytes of decoded output`,
+    );
+  }
+
+  const segments = [];
+  const end = start + length;
+  let cur = null;
+  for (let p = start; p < end; p++) {
+    const kind = provenance.kind[p];
+    const origin = provenance.origin[p];
+    const inst = provenance.inst[p];
+    const extendsCurrent =
+      cur !== null &&
+      cur.kindValue === kind &&
+      cur.instOffset === inst &&
+      (origin === cur.lastOrigin + 1 || (kind === ORIGIN_RUN && origin === cur.lastOrigin));
+    if (extendsCurrent) {
+      cur.outputEnd = p + 1;
+      cur.originEnd = origin + 1;
+      cur.lastOrigin = origin;
+    } else {
+      cur = {
+        outputStart: p,
+        outputEnd: p + 1,
+        kindValue: kind,
+        originStart: origin,
+        originEnd: origin + 1,
+        instOffset: inst,
+        lastOrigin: origin,
+      };
+      segments.push(cur);
+    }
+  }
+  return segments.map((s) => ({
+    outputStart: s.outputStart,
+    outputEnd: s.outputEnd,
+    kind: ORIGIN_KIND_NAMES[s.kindValue],
+    originStart: s.originStart,
+    originEnd: s.originEnd,
+    instOffset: s.instOffset,
+  }));
 }

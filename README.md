@@ -7,6 +7,10 @@
 - 每个窗口的源区间（SOURCE 基准字典 / TARGET 前序窗口输出 / 无源段）；
 - 按指令顺序列出的 ADD、RUN、COPY 证据（尺寸、数据 hex、地址模式、U 空间地址、
   解析后的实际指向区间、原始偏移）；
+- **可选根源追溯**：填写最终输出的起始位置与长度，返回该区间的连续根源片段——
+  每段给出最终输出范围、根源类型（基准字典 / ADD / RUN）、根源字节范围
+  （字典偏移或 Delta 数据段原始偏移）以及**首次产生它的指令原始偏移**
+  （后续 COPY 只传递标签，绝不冒充根源）；
 - 失败时给出错误码与**首个原始偏移**，且不保留任何部分输出；
 - 可一键清空输入与结论。
 
@@ -79,6 +83,12 @@ echo "exit=$?"
 { "deltaBase64": "1sPExAAAAA...", "dictionaryBase64": "" }
 ```
 
+可选根源追溯字段（必须成对出现，均为整数；`traceStart ≥ 0`、`traceLength ≥ 1`）：
+
+```json
+{ "deltaBase64": "1sPExAAAAA...", "dictionaryBase64": "", "traceStart": 24, "traceLength": 13 }
+```
+
 成功 `200`：
 
 ```json
@@ -100,9 +110,29 @@ echo "exit=$?"
       ]
     }
   ],
+  "trace": {
+    "start": 24,
+    "length": 13,
+    "segments": [
+      { "outputStart": 24, "outputEnd": 25, "kind": "SOURCE_DICT",
+        "originStart": 10, "originEnd": 11, "instOffset": 20 },
+      { "outputStart": 25, "outputEnd": 30, "kind": "ADD",
+        "originStart": 14, "originEnd": 19, "instOffset": 21 }
+    ]
+  },
   "limits": { "maxOutputBytes": 524288, "maxWindows": 8 }
 }
 ```
+
+`trace.segments` 为覆盖查询区间的连续根源片段：`outputStart/outputEnd` 是最终输出范围，
+`kind` 是根源类型（`SOURCE_DICT` 基准字典 / `ADD` / `RUN`），`originStart/originEnd`
+是根源字节范围（`SOURCE_DICT` 为字典偏移，`ADD`/`RUN` 为 Delta 数据段原始偏移），
+`instOffset` 是**首次产生**这些字节的指令原始偏移——前序窗口或自重叠 COPY 复制的字节
+继承原标签，后续 COPY 的指令位置不会被误当作根源。未提供追溯字段时响应不含 `trace`，
+长度摘要与指令证据保持原有语义。
+
+追溯范围非法（非整数、长度为零、只填其一）→ `400 BAD_TRACE`；越出最终输出 →
+`400 TRACE_RANGE`；两者都拒绝本次请求，页面随之清除旧结论。
 
 失败 `400/413`：
 

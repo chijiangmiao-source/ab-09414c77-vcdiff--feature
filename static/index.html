@@ -28,6 +28,11 @@
     font-size: 12px; word-break: break-all; }
   textarea:focus { outline: none; border-color: var(--accent); }
   textarea.over { border-color: var(--err); }
+  .trace-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+  input[type="text"] { width: 100%; background: #0d1226; color: var(--txt);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
+    font-family: var(--mono); font-size: 12px; }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); }
   .btns { display: flex; gap: 10px; margin-top: 4px; }
   button { border: 0; border-radius: 7px; padding: 9px 18px; font-size: 13.5px; cursor: pointer; }
   button.primary { background: var(--accent); color: #0b1020; font-weight: 600; }
@@ -88,6 +93,16 @@
         <span class="lbl"><span>Base64 基准字典（≤ 64 KiB，可留空）</span><span id="dictCount">0 B</span></span>
         <textarea id="dict" spellcheck="false" placeholder="SOURCE 窗口使用的基准字典字节的 Base64" autocomplete="off"></textarea>
       </label>
+      <div class="trace-grid">
+        <label class="field">
+          <span class="lbl"><span>追溯起始位置（可选）</span></span>
+          <input id="traceStart" type="text" inputmode="numeric" placeholder="留空则不追溯" autocomplete="off">
+        </label>
+        <label class="field">
+          <span class="lbl"><span>追溯长度（可选，&gt; 0）</span></span>
+          <input id="traceLength" type="text" inputmode="numeric" placeholder="留空则不追溯" autocomplete="off">
+        </label>
+      </div>
       <div class="btns">
         <button type="submit" class="primary" id="submitBtn">提交真实接口校验</button>
         <button type="button" class="ghost" id="clearBtn">清空输入与结论</button>
@@ -99,6 +114,9 @@
       <li>整数必须最短编码；三段长度须精确吻合</li>
       <li>COPY 仅允许读取 SOURCE / 前序 TARGET 或当前窗口已生成字节</li>
       <li>地址缓存按窗口维护：<code>SELF / HERE / NEAR×4 / SAME×3</code></li>
+      <li>可选追溯：填写最终输出的起始位置与长度，返回该区间的连续根源片段
+        （基准字典 / ADD / RUN，含根源字节范围与首产指令原始偏移）；
+        范围越界、长度为零或非整数将拒绝本次请求并清除旧结论</li>
     </ul>
   </section>
 
@@ -192,6 +210,38 @@ function renderWindow(w) {
   </div>`;
 }
 
+function originText(s) {
+  if (s.kind === 'SOURCE_DICT') return `基准字典 <span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+  if (s.kind === 'ADD') return `Delta 数据段 <span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+  return `Delta 数据字节 <span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+}
+
+function renderTrace(trace) {
+  if (!trace) return '';
+  const rows = trace.segments.map((s, i) => `
+    <tr>
+      <td class="num">${i}</td>
+      <td class="hex">[${s.outputStart}, ${s.outputEnd})</td>
+      <td>${tag(s.kind, s.kind)}</td>
+      <td>${originText(s)}</td>
+      <td class="num">${s.instOffset}</td>
+    </tr>`).join('');
+  return `
+  <div class="window">
+    <div class="wh">
+      <span>根源追溯：最终输出 <b>[${trace.start}, ${trace.start + trace.length})</b></span>
+      <span>${trace.length} B · ${trace.segments.length} 个连续根源片段</span>
+      <span class="muted">根源指令偏移均为首个产生该字节的指令，后续 COPY 不计</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>#</th><th>最终输出范围</th><th>根源类型</th><th>根源字节范围</th><th>首产指令原始偏移</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
 function renderOk(data) {
   const winHtml = data.windows.map(renderWindow).join('');
   return `
@@ -201,6 +251,7 @@ function renderOk(data) {
     <div class="stat"><div class="k">窗口数量</div><div class="v">${data.windows.length} / ${data.limits.maxWindows}</div></div>
     <div class="stat"><div class="k">SHA-256</div><div class="v" style="font-size:11.5px">${esc(data.sha256)}</div></div>
   </div>
+  ${renderTrace(data.trace)}
   ${winHtml}`;
 }
 
@@ -230,6 +281,25 @@ $('form').addEventListener('submit', async (ev) => {
     return;
   }
 
+  const body = { deltaBase64: deltaB64, dictionaryBase64: dictB64 };
+
+  // Optional root-origin trace: both fields together, non-negative integer
+  // start, positive integer length. An invalid range rejects this request
+  // and clears the previous conclusions.
+  const tsText = $('traceStart').value.trim();
+  const tlText = $('traceLength').value.trim();
+  if (tsText !== '' || tlText !== '') {
+    const startN = /^\d+$/.test(tsText) ? Number(tsText) : NaN;
+    const lenN = /^\d+$/.test(tlText) ? Number(tlText) : NaN;
+    if (!Number.isSafeInteger(startN) || !Number.isSafeInteger(lenN) || lenN < 1) {
+      $('result').innerHTML =
+        '<div class="alert error"><span class="code">BAD_TRACE</span> — 追溯范围无效：起始位置须为非负整数、长度须为正整数。本次请求已拒绝，旧结论已清除。</div>';
+      return;
+    }
+    body.traceStart = startN;
+    body.traceLength = lenN;
+  }
+
   btn.disabled = true;
   btn.textContent = '校验中…';
   $('result').innerHTML = '<div class="placeholder">正在调用 /api/decode …</div>';
@@ -237,7 +307,7 @@ $('form').addEventListener('submit', async (ev) => {
     const resp = await fetch('/api/decode', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ deltaBase64: deltaB64, dictionaryBase64: dictB64 }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json();
     $('result').innerHTML = data.ok ? renderOk(data) : renderError(data);
@@ -253,6 +323,8 @@ $('form').addEventListener('submit', async (ev) => {
 $('clearBtn').addEventListener('click', async () => {
   deltaEl.value = '';
   dictEl.value = '';
+  $('traceStart').value = '';
+  $('traceLength').value = '';
   updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
   updateCounter(dictEl, dictCount, DICT_LIMIT);
   $('result').innerHTML = '<div class="placeholder">输入与结论均已清空。</div>';

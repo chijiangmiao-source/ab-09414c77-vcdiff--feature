@@ -72,6 +72,74 @@ async function smokeTest(baseUrl) {
   expect(JSON.stringify(copyModes) === JSON.stringify(['SELF', 'NEAR0', 'SAME0']),
     `window 2 copy modes SELF/NEAR0/SAME0 (got ${copyModes})`);
   expect(w2.instructions.every((ins, idx) => ins.seq === idx), 'instructions listed in execution order');
+  expect(!('trace' in ok), 'no trace section when trace fields are absent');
+
+  // --- root-origin trace over window 2's output ------------------------------
+  const trResp = await fetch(`${baseUrl}/api/decode`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      traceStart: 24,
+      traceLength: 13,
+    }),
+  });
+  expect(trResp.status === 200, `trace request HTTP 200 (got ${trResp.status})`);
+  const tr = await trResp.json();
+  const segs = tr.trace?.segments ?? [];
+  expect(
+    JSON.stringify(segs.map((s) => s.kind)) ===
+      JSON.stringify(['SOURCE_DICT', 'ADD', 'ADD', 'SOURCE_DICT', 'ADD']),
+    `trace segment kinds (got ${segs.map((s) => s.kind)})`,
+  );
+  const w1copyOffset = tr.windows[0].instructions.find((i) => i.op === 'COPY').codeOffset;
+  const w2copyOffsets = tr.windows[1].instructions
+    .filter((i) => i.op === 'COPY')
+    .map((i) => i.codeOffset);
+  expect(
+    segs.length > 0 &&
+      segs[0].outputStart === 24 &&
+      segs[segs.length - 1].outputEnd === 37 &&
+      segs.every((s, i) => i === 0 || s.outputStart === segs[i - 1].outputEnd),
+    'trace segments are consecutive and cover [24, 37)',
+  );
+  expect(
+    segs[0].instOffset === w1copyOffset && !segs.some((s) => w2copyOffsets.includes(s.instOffset)),
+    'root instruction is window 1 COPY, never a later window 2 COPY',
+  );
+
+  // --- invalid trace ranges reject the whole request -------------------------
+  const badTraceResp = await fetch(`${baseUrl}/api/decode`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      traceStart: 0,
+      traceLength: 0,
+    }),
+  });
+  const badTrace = await badTraceResp.json();
+  expect(
+    badTraceResp.status === 400 && badTrace.error?.code === 'BAD_TRACE',
+    `zero-length trace rejected (got ${badTraceResp.status} ${badTrace.error?.code})`,
+  );
+  const oorTraceResp = await fetch(`${baseUrl}/api/decode`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deltaBase64: samples.valid.deltaBase64,
+      dictionaryBase64: samples.dictionaryBase64,
+      traceStart: 0,
+      traceLength: samples.valid.expectedLength + 1,
+    }),
+  });
+  const oorTrace = await oorTraceResp.json();
+  expect(
+    oorTraceResp.status === 400 && oorTrace.error?.code === 'TRACE_RANGE',
+    `out-of-range trace rejected (got ${oorTraceResp.status} ${oorTrace.error?.code})`,
+  );
 
   // --- failure path: first raw offset, no output ---------------------------
   const badResp = await fetch(`${baseUrl}/api/decode`, {

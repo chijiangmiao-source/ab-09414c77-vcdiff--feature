@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import {
   decodeVcdiff,
+  collectRootSegments,
   buildDefaultCodeTable,
   DEFAULT_CODE_TABLE,
   VcdiffError,
@@ -14,6 +15,9 @@ import {
   COPY,
   NOOP,
   MAX_OUTPUT_BYTES,
+  ORIGIN_ADD,
+  ORIGIN_RUN,
+  ORIGIN_SOURCE_DICT,
 } from '../src/vcdiff.js';
 import { WindowEncoder, assemble, header, encodeInteger } from './helpers/encoder.js';
 
@@ -341,6 +345,151 @@ describe('strict rejection', () => {
     const raw = assemble(w.build());
     const patched = tamperTargetLength(raw, 99);
     reject(patched, dict, 'TARGET_LENGTH');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Root-origin provenance: every output byte inherits a recomputable label
+// ---------------------------------------------------------------------------
+
+describe('root-origin provenance', () => {
+  const dict = te.encode('0123456789-HELLO-DICT');
+
+  test('ADD, RUN and dictionary COPY bytes carry root labels', () => {
+    const w = new WindowEncoder('SOURCE', 0, dict.length);
+    w.copy(0, 4); // output[0:4] <- dict[0:4]
+    w.add(te.encode('XY')); // output[4:6]
+    w.run(0x21, 3); // output[6:9]
+    const delta = assemble(w.build());
+    const res = decodeVcdiff(delta, dict, { provenance: true });
+    assert.ok(res.provenance);
+    assert.equal(res.provenance.kind.length, res.length);
+
+    const segs = collectRootSegments(res.provenance, 0, res.length);
+    assert.equal(segs.length, 3);
+    assert.deepEqual(segs.map((s) => s.kind), ['SOURCE_DICT', 'ADD', 'RUN']);
+    assert.deepEqual([segs[0].outputStart, segs[0].outputEnd], [0, 4]);
+    assert.deepEqual([segs[0].originStart, segs[0].originEnd], [0, 4]);
+    assert.deepEqual([segs[1].outputStart, segs[1].outputEnd], [4, 6]);
+    assert.deepEqual([segs[2].outputStart, segs[2].outputEnd], [6, 9]);
+
+    // Root ranges are recomputable against the raw inputs.
+    assert.deepEqual([...delta.slice(segs[1].originStart, segs[1].originEnd)], [...te.encode('XY')]);
+    assert.equal(segs[2].originEnd - segs[2].originStart, 1); // RUN root is one byte
+    assert.equal(delta[segs[2].originStart], 0x21);
+
+    // instOffset is the raw offset of the producing instruction itself.
+    const insts = res.windows[0].instructions;
+    assert.equal(segs[0].instOffset, insts.find((i) => i.op === 'COPY').codeOffset);
+    assert.equal(segs[1].instOffset, insts.find((i) => i.op === 'ADD').codeOffset);
+    assert.equal(segs[2].instOffset, insts.find((i) => i.op === 'RUN').codeOffset);
+  });
+
+  test('bytes copied from a prior window keep their original root labels', () => {
+    const w1 = new WindowEncoder('SOURCE', 0, dict.length);
+    w1.copy(0, 11); // dict -> output[0:11]
+    w1.add(te.encode('WORLD')); // output[11:16]
+    const w2 = new WindowEncoder('TARGET', 5, 11);
+    w2.copy(5, 5); // output[16:21] <- output[10:15] == '-' + 'WORL'
+    w2.copy(10, 1); // output[21] <- output[15] == 'D'
+    const res = decodeVcdiff(assemble(w1.build(), w2.build()), dict, { provenance: true });
+
+    const w1copy = res.windows[0].instructions[0];
+    const w1add = res.windows[0].instructions[1];
+    const w2copies = res.windows[1].instructions.filter((i) => i.op === 'COPY');
+
+    const segs = collectRootSegments(res.provenance, 16, 6);
+    assert.deepEqual(segs.map((s) => s.kind), ['SOURCE_DICT', 'ADD']);
+    assert.deepEqual([segs[0].outputStart, segs[0].outputEnd], [16, 17]);
+    assert.deepEqual([segs[0].originStart, segs[0].originEnd], [10, 11]);
+    assert.deepEqual([segs[1].outputStart, segs[1].outputEnd], [17, 22]);
+
+    // The root instruction is window 1's COPY/ADD — never window 2's COPY.
+    assert.equal(segs[0].instOffset, w1copy.codeOffset);
+    assert.equal(segs[1].instOffset, w1add.codeOffset);
+    for (const s of segs) {
+      assert.ok(!w2copies.some((c) => c.codeOffset === s.instOffset));
+    }
+  });
+
+  test('self-overlapping COPY inherits labels byte-by-byte', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('ab'));
+    w.copy(0, 6, { mode: 1 }); // repeats "ab" three more times
+    const res = decodeVcdiff(assemble(w.build()), new Uint8Array(0), { provenance: true });
+    assert.deepEqual(res.output, te.encode('abababab'));
+
+    const addIns = res.windows[0].instructions.find((i) => i.op === 'ADD');
+    for (let p = 2; p < 8; p++) {
+      assert.equal(res.provenance.kind[p], ORIGIN_ADD, `byte ${p}`);
+      assert.equal(res.provenance.inst[p], addIns.codeOffset, `byte ${p}`);
+    }
+    // Copies of 'a' share the root position of the original 'a', likewise 'b'.
+    assert.equal(res.provenance.origin[2], res.provenance.origin[0]);
+    assert.equal(res.provenance.origin[3], res.provenance.origin[1]);
+    assert.equal(res.provenance.origin[4], res.provenance.origin[0]);
+    assert.equal(res.provenance.origin[5], res.provenance.origin[1]);
+  });
+
+  test('RUN bytes propagated through a later window keep the RUN root', () => {
+    const w1 = new WindowEncoder('NONE');
+    w1.run(0x51, 5); // output[0:5]
+    const w2 = new WindowEncoder('TARGET', 0, 5);
+    w2.copy(0, 5); // output[5:10] <- output[0:5]
+    const res = decodeVcdiff(assemble(w1.build(), w2.build()), new Uint8Array(0), { provenance: true });
+
+    const runIns = res.windows[0].instructions.find((i) => i.op === 'RUN');
+    const segs = collectRootSegments(res.provenance, 0, res.length);
+    assert.equal(segs.length, 1); // contiguous RUN roots merge across windows
+    assert.equal(segs[0].kind, 'RUN');
+    assert.deepEqual([segs[0].outputStart, segs[0].outputEnd], [0, 10]);
+    assert.equal(segs[0].instOffset, runIns.codeOffset);
+    assert.equal(segs[0].originEnd - segs[0].originStart, 1);
+  });
+
+  test('segments split at label boundaries and cover the queried range', () => {
+    const w = new WindowEncoder('SOURCE', 0, dict.length);
+    w.copy(0, 4);
+    w.add(te.encode('XY'));
+    w.run(0x21, 3);
+    const res = decodeVcdiff(assemble(w.build()), dict, { provenance: true });
+    const segs = collectRootSegments(res.provenance, 1, 7); // [1, 8)
+    assert.equal(segs.length, 3);
+    assert.equal(segs[0].outputStart, 1);
+    assert.equal(segs[segs.length - 1].outputEnd, 8);
+    for (let i = 1; i < segs.length; i++) {
+      assert.equal(segs[i].outputStart, segs[i - 1].outputEnd);
+    }
+  });
+
+  test('provenance is only returned when requested', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('x'));
+    const res = decodeVcdiff(assemble(w.build()));
+    assert.equal(res.provenance, undefined);
+  });
+
+  test('collectRootSegments rejects invalid ranges', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('xyz'));
+    const res = decodeVcdiff(assemble(w.build()), new Uint8Array(0), { provenance: true });
+    expectError(() => collectRootSegments(res.provenance, 0, 0), 'TRACE_RANGE');
+    expectError(() => collectRootSegments(res.provenance, 2, 2), 'TRACE_RANGE');
+    expectError(() => collectRootSegments(res.provenance, -1, 2), 'TRACE_RANGE');
+    expectError(() => collectRootSegments(res.provenance, 0.5, 2), 'TRACE_RANGE');
+    expectError(() => collectRootSegments(null, 0, 1), 'BAD_INPUT');
+  });
+
+  test('per-byte label kinds use the exported constants', () => {
+    const w = new WindowEncoder('SOURCE', 0, dict.length);
+    w.copy(0, 2);
+    w.add(te.encode('Z'));
+    w.run(0x21, 1);
+    const res = decodeVcdiff(assemble(w.build()), dict, { provenance: true });
+    assert.deepEqual(
+      [...res.provenance.kind],
+      [ORIGIN_SOURCE_DICT, ORIGIN_SOURCE_DICT, ORIGIN_ADD, ORIGIN_RUN],
+    );
   });
 });
 

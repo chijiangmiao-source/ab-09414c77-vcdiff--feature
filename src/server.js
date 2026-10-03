@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decodeVcdiff, MAX_OUTPUT_BYTES, MAX_WINDOWS, VcdiffError } from './vcdiff.js';
+import { decodeVcdiff, collectRootSegments, MAX_OUTPUT_BYTES, MAX_WINDOWS, VcdiffError } from './vcdiff.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PAGE_HTML = readFileSync(join(here, '..', 'static', 'index.html'));
@@ -92,12 +92,50 @@ export function handleDecode(rawBody) {
   const delta = decodeBase64Field(deltaBase64, 'deltaBase64');
   const dictionary = decodeBase64Field(dictText, 'dictionaryBase64');
 
+  // Optional root-origin trace over the final output. Both fields must be
+  // supplied together and must be integers (start >= 0, length >= 1);
+  // anything else rejects the whole request.
+  const { traceStart, traceLength } = parsed;
+  const traceRequested = traceStart !== undefined || traceLength !== undefined;
+  if (traceRequested) {
+    if (
+      typeof traceStart !== 'number' ||
+      !Number.isInteger(traceStart) ||
+      traceStart < 0 ||
+      typeof traceLength !== 'number' ||
+      !Number.isInteger(traceLength) ||
+      traceLength < 1
+    ) {
+      throw new VcdiffError(
+        'BAD_TRACE',
+        'traceStart and traceLength must be supplied together as integers ' +
+          '(start >= 0, length >= 1)',
+      );
+    }
+  }
+
   // The decoder either returns the complete output, or throws; on failure no
   // partial output leaves this function.
-  const result = decodeVcdiff(delta, dictionary);
+  const result = decodeVcdiff(delta, dictionary, { provenance: traceRequested });
+
+  let trace = null;
+  if (traceRequested) {
+    if (traceStart > result.length || traceLength > result.length - traceStart) {
+      throw new VcdiffError(
+        'TRACE_RANGE',
+        `trace range [${traceStart}, +${traceLength}) lies outside the ` +
+          `${result.length} bytes of decoded output`,
+      );
+    }
+    trace = {
+      start: traceStart,
+      length: traceLength,
+      segments: collectRootSegments(result.provenance, traceStart, traceLength),
+    };
+  }
 
   const sha256 = createHash('sha256').update(result.output).digest('hex');
-  return {
+  const body = {
     ok: true,
     length: result.length,
     sha256,
@@ -113,6 +151,8 @@ export function handleDecode(rawBody) {
     })),
     limits: { maxOutputBytes: MAX_OUTPUT_BYTES, maxWindows: MAX_WINDOWS },
   };
+  if (trace) body.trace = trace;
+  return body;
 }
 
 export function createApp() {
