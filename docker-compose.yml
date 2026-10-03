@@ -1,0 +1,43 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vcdiff-archive-guard:latest
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      # Published host port is configurable via HOST_PORT (default 8080).
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+    networks:
+      - vcdnet
+
+  # One-shot service: runs decoding unit tests, the build check and the
+  # interface/HTTP smoke tests against the healthy web service, then exits
+  # with a status code (0 = all checks passed).
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vcdiff-archive-guard:verify
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SMOKE_BASE_URL: "http://web:8080"
+    command: ["node", "scripts/verify.js"]
+    networks:
+      - vcdnet
+    restart: "no"
+
+networks:
+  vcdnet:
+    driver: bridge

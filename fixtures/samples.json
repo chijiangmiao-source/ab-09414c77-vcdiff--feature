@@ -1,0 +1,24 @@
+{
+  "generatedAt": "2026-10-03T01:58:22.038Z",
+  "dictionaryBase64": "MDEyMzQ1Njc4OS1IRUxMTy1ESUNU",
+  "valid": {
+    "deltaBase64": "1sPEAAABFQASGAAGBQJXT1JMRCF7BhQABAALAgsFDw0AAgUDPj4VMwEDdQUFBQ==",
+    "expectedLength": 37,
+    "expectedSha256": "ddd5ab03586895b80bdd1995dca18db89012c831af8dbb24221d8dfcbaafa1c0",
+    "expectedWindowCount": 2
+  },
+  "badCopy": {
+    "deltaBase64": "1sPEAAABFQASGAAGBQJXT1JMRCF7BhQABAALAgsFCgYAAgIBWFkDJAA=",
+    "expectedCode": "COPY_NOT_GENERATED",
+    "expectedOffset": 39
+  },
+  "nonMinimal": {
+    "deltaBase64": "1sPEAAABFQATGAAGBgJXT1JMRCF7BhQAgAQACw==",
+    "expectedCode": "NON_MINIMAL_INTEGER",
+    "expectedOffset": 24
+  },
+  "truncated": {
+    "deltaBase64": "1sPEAAABFQASGAAGBQJXT1JMRCF7BhQABAALAgsFDw0AAgUDPj4VMwEDdQ==",
+    "expectedCode": "TRUNCATED"
+  }
+}

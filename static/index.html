@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>深空归档增量标定片校验台 · VCDIFF RFC 3284</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141a2e; --panel2: #1b223a; --line: #2a3354;
+    --txt: #e8ecf8; --muted: #97a0c0; --accent: #6ea8fe; --ok: #41d18b;
+    --warn: #ffb454; --err: #ff6b6b; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt);
+    font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 20px 28px 14px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 4px; font-size: 19px; letter-spacing: .5px; }
+  header p { margin: 0; color: var(--muted); font-size: 12.5px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 22px 28px 60px; display: grid;
+    grid-template-columns: minmax(320px, 430px) 1fr; gap: 22px; align-items: start; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--accent); letter-spacing: .4px; }
+  label.field { display: block; margin-bottom: 14px; }
+  label.field span.lbl { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+  textarea { width: 100%; min-height: 128px; resize: vertical; background: #0d1226; color: var(--txt);
+    border: 1px solid var(--line); border-radius: 7px; padding: 10px; font-family: var(--mono);
+    font-size: 12px; word-break: break-all; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  textarea.over { border-color: var(--err); }
+  .btns { display: flex; gap: 10px; margin-top: 4px; }
+  button { border: 0; border-radius: 7px; padding: 9px 18px; font-size: 13.5px; cursor: pointer; }
+  button.primary { background: var(--accent); color: #0b1020; font-weight: 600; }
+  button.primary:disabled { opacity: .55; cursor: wait; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button.ghost:hover { color: var(--txt); border-color: var(--accent); }
+  .rules { margin-top: 16px; font-size: 12px; color: var(--muted); }
+  .rules code { color: #b8c3e8; }
+  .rules li { margin-bottom: 3px; }
+  .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+  .stat { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat .k { font-size: 11.5px; color: var(--muted); }
+  .stat .v { font-family: var(--mono); font-size: 16px; margin-top: 3px; word-break: break-all; }
+  .window { background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; margin-bottom: 14px; overflow: hidden; }
+  .window > .wh { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12.5px; }
+  .window > .wh b { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #232b48; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; background: #171e35; position: sticky; top: 0; }
+  td.num { text-align: right; color: #aab4d8; }
+  .tag { display: inline-block; padding: 0 7px; border-radius: 20px; font-size: 11px; font-family: var(--mono); }
+  .tag.ADD { background: #1e3a5f; color: #8fc1ff; }
+  .tag.RUN { background: #3a2f1e; color: #ffc97a; }
+  .tag.COPY { background: #1e3a2c; color: #74e3a6; }
+  .tag.SELF, .tag.HERE { background: #25314f; color: #9db8f5; }
+  .tag.NEAR0, .tag.NEAR1, .tag.NEAR2, .tag.NEAR3 { background: #3a2a4f; color: #d3a6ff; }
+  .tag.SAME0, .tag.SAME1, .tag.SAME2 { background: #4f3a2a; color: #ffb98a; }
+  .tag.PRIOR_TARGET, .tag.CURRENT_TARGET { background: #3a2a4f; color: #d3a6ff; }
+  .tag.SOURCE_DICT { background: #1e3a5f; color: #8fc1ff; }
+  .tag.NONE { background: #2a2f45; color: var(--muted); }
+  .hex { color: #c6cfe8; word-break: break-all; }
+  .placeholder { color: var(--muted); font-size: 13px; padding: 26px 8px; text-align: center; }
+  .alert { border-radius: 9px; padding: 13px 16px; margin-bottom: 14px; font-size: 13.5px; }
+  .alert.error { background: #3a1d24; border: 1px solid #6e2c38; color: #ffc4c4; }
+  .alert.ok { background: #173024; border: 1px solid #27613f; color: #baf3d5; }
+  .alert .code { font-family: var(--mono); color: #ff9b9b; font-weight: 700; }
+  .offset-pill { font-family: var(--mono); background: #0d1226; border: 1px solid #6e2c38; border-radius: 6px; padding: 1px 8px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  details.sec { margin-top: 6px; }
+  details.sec summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>深空归档 · 增量标定片导入校验台</h1>
+  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。</p>
+</header>
+
+<main>
+  <section class="card" id="inputcard">
+    <h2>导入输入</h2>
+    <form id="form">
+      <label class="field">
+        <span class="lbl"><span>Base64 VCDIFF 载荷（≤ 128 KiB）</span><span id="deltaCount">0 B</span></span>
+        <textarea id="delta" spellcheck="false" placeholder="例如：1sPExAAAAA...（D6 C3 C4 起始的流的 Base64）" autocomplete="off"></textarea>
+      </label>
+      <label class="field">
+        <span class="lbl"><span>Base64 基准字典（≤ 64 KiB，可留空）</span><span id="dictCount">0 B</span></span>
+        <textarea id="dict" spellcheck="false" placeholder="SOURCE 窗口使用的基准字典字节的 Base64" autocomplete="off"></textarea>
+      </label>
+      <div class="btns">
+        <button type="submit" class="primary" id="submitBtn">提交真实接口校验</button>
+        <button type="button" class="ghost" id="clearBtn">清空输入与结论</button>
+      </div>
+    </form>
+    <ul class="rules">
+      <li>仅接受 <code>D6 C3 C4 00 00</code> 头、RFC 3284 默认码表</li>
+      <li>不允许二次压缩；窗口数 ≤ <code>8</code>；输出硬上限 <code>512 KiB</code></li>
+      <li>整数必须最短编码；三段长度须精确吻合</li>
+      <li>COPY 仅允许读取 SOURCE / 前序 TARGET 或当前窗口已生成字节</li>
+      <li>地址缓存按窗口维护：<code>SELF / HERE / NEAR×4 / SAME×3</code></li>
+    </ul>
+  </section>
+
+  <section class="card" id="resultcard">
+    <h2>接口结论</h2>
+    <div id="result"><div class="placeholder">尚未提交。校验结果、窗口源区间与 ADD / RUN / COPY 证据将在此按指令顺序列出。</div></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const deltaEl = $('delta'), dictEl = $('dict');
+const deltaCount = $('deltaCount'), dictCount = $('dictCount');
+
+const DELTA_LIMIT = 128 * 1024;
+const DICT_LIMIT = 64 * 1024;
+
+function updateCounter(el, counter, limit) {
+  const n = el.value.length;
+  counter.textContent = n.toLocaleString('en') + ' B';
+  counter.style.color = n > limit ? 'var(--err)' : '';
+  el.classList.toggle('over', n > limit);
+}
+deltaEl.addEventListener('input', () => updateCounter(deltaEl, deltaCount, DELTA_LIMIT));
+dictEl.addEventListener('input', () => updateCounter(dictEl, dictCount, DICT_LIMIT));
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function tag(text, cls) { return `<span class="tag ${esc(cls)}">${esc(text)}</span>`; }
+
+function describeRange(r) {
+  if (!r) return '';
+  const area = tag(r.area, r.area);
+  const span = r.start === undefined ? '' :
+    `<span class="hex">[${r.start}, ${r.end})</span>`;
+  return area + ' ' + span;
+}
+
+function renderInstruction(ins) {
+  const cells = [];
+  cells.push(`<td class="num">${ins.seq}</td>`);
+  if (ins.op === 'ADD') {
+    cells.push(`<td>${tag('ADD', 'ADD')}</td>`);
+    cells.push(`<td class="num">${ins.size}</td>`);
+    cells.push(`<td class="hex" colspan="4">${esc(ins.dataHex)}</td>`);
+  } else if (ins.op === 'RUN') {
+    cells.push(`<td>${tag('RUN', 'RUN')}</td>`);
+    cells.push(`<td class="num">${ins.size}</td>`);
+    cells.push(`<td colspan="3">重复字节 <span class="hex">0x${esc(ins.byteHex)}</span></td>`);
+    cells.push('<td></td>');
+  } else {
+    cells.push(`<td>${tag('COPY', 'COPY')} ${tag(ins.mode, ins.mode)}</td>`);
+    cells.push(`<td class="num">${ins.size}</td>`);
+    cells.push(`<td>U地址 <span class="hex">${ins.address}</span><br>
+      <span class="muted">编码值 ${ins.encoded} @偏移 ${ins.encodedOffset}${ins.overlaps ? ' · 自重叠逐字节' : ''}</span></td>`);
+    cells.push(`<td>${describeRange(ins.range)}</td>`);
+    cells.push('<td></td>');
+  }
+  cells.push(`<td class="num muted">${ins.codeOffset}</td>`);
+  return '<tr>' + cells.join('') + '</tr>';
+}
+
+function renderWindow(w) {
+  const src = w.source;
+  let srcText;
+  if (src.kind === 'NONE') {
+    srcText = tag('无源段 NONE', 'NONE');
+  } else {
+    srcText = tag(src.kind === 'SOURCE' ? 'SOURCE 基准字典' : 'TARGET 前序输出', src.kind) +
+      ` <span class="hex">位置 ${src.position} · 长度 ${src.length} · 区间 [${src.position}, ${src.position + src.length})</span>`;
+  }
+  const rows = w.instructions.map(renderInstruction).join('');
+  return `
+  <div class="window">
+    <div class="wh">
+      <span>窗口 <b>#${w.index}</b></span>
+      <span>源区间：${srcText}</span>
+      <span>目标：输出 <span class="hex">[${w.targetOffset}, ${w.targetOffset + w.targetLength})</span> · ${w.targetLength} B</span>
+      <span>Delta 长度 ${w.deltaLength} B（数据 ${w.sections.data} / 指令 ${w.sections.instructions} / 地址 ${w.sections.addresses}）</span>
+      <span class="muted">窗口起始原始偏移 ${w.windowOffset}</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>#</th><th>指令</th><th>长度</th><th>地址 / 模式</th><th>实际指向</th><th>数据</th><th>指令偏移</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+function renderOk(data) {
+  const winHtml = data.windows.map(renderWindow).join('');
+  return `
+  <div class="alert ok">✓ 解码成功：全部 ${data.windows.length} 个窗口已校验，所有 COPY 地址均未越界。输出 ${data.length.toLocaleString('en')} 字节（上限 ${data.limits.maxOutputBytes.toLocaleString('en')}）。</div>
+  <div class="summary">
+    <div class="stat"><div class="k">最终字节长度</div><div class="v">${data.length.toLocaleString('en')}</div></div>
+    <div class="stat"><div class="k">窗口数量</div><div class="v">${data.windows.length} / ${data.limits.maxWindows}</div></div>
+    <div class="stat"><div class="k">SHA-256</div><div class="v" style="font-size:11.5px">${esc(data.sha256)}</div></div>
+  </div>
+  ${winHtml}`;
+}
+
+function renderError(payload) {
+  const e = payload.error || {};
+  const off = (e.offset === null || e.offset === undefined)
+    ? '不适用' : `<span class="offset-pill">首个原始偏移 ${e.offset} (0x${Number(e.offset).toString(16)})</span>`;
+  return `
+  <div class="alert error">
+    <div style="margin-bottom:6px">✗ <span class="code">${esc(e.code || 'ERROR')}</span> — ${esc(e.message || '解码失败')}</div>
+    <div>${off} <span class="muted">已中止解码，未保留任何部分输出。</span></div>
+  </div>`;
+}
+
+$('form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const btn = $('submitBtn');
+  const deltaB64 = deltaEl.value.trim();
+  const dictB64 = dictEl.value.trim();
+
+  if (deltaB64.length === 0) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">BAD_REQUEST</span> — 请粘贴 VCDIFF 载荷。</div>';
+    return;
+  }
+  if (deltaB64.length > DELTA_LIMIT || dictB64.length > DICT_LIMIT) {
+    $('result').innerHTML = '<div class="alert error"><span class="code">PAYLOAD_TOO_LARGE</span> — 输入超过页面允许长度。</div>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '校验中…';
+  $('result').innerHTML = '<div class="placeholder">正在调用 /api/decode …</div>';
+  try {
+    const resp = await fetch('/api/decode', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deltaBase64: deltaB64, dictionaryBase64: dictB64 }),
+    });
+    const data = await resp.json();
+    $('result').innerHTML = data.ok ? renderOk(data) : renderError(data);
+  } catch (err) {
+    $('result').innerHTML =
+      `<div class="alert error"><span class="code">NETWORK</span> — 接口请求失败：${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '提交真实接口校验';
+  }
+});
+
+$('clearBtn').addEventListener('click', async () => {
+  deltaEl.value = '';
+  dictEl.value = '';
+  updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
+  updateCounter(dictEl, dictCount, DICT_LIMIT);
+  $('result').innerHTML = '<div class="placeholder">输入与结论均已清空。</div>';
+  try { await fetch('/api/reset', { method: 'POST' }); } catch { /* stateless */ }
+  deltaEl.focus();
+});
+
+updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
+updateCounter(dictEl, dictCount, DICT_LIMIT);
+</script>
+</body>
+</html>
