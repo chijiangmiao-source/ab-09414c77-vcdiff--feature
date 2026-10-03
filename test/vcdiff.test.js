@@ -345,6 +345,209 @@ describe('strict rejection', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Provenance trace: every output byte carries a recomputable root label
+// ---------------------------------------------------------------------------
+
+describe('provenance trace', () => {
+  const dict = te.encode('0123456789-HELLO-DICT');
+
+  // Segments must tile [start, start+length) with no gaps or overlaps.
+  function assertTiling(trace, start, length) {
+    assert.equal(trace.start, start);
+    assert.equal(trace.length, length);
+    assert.ok(trace.segments.length > 0);
+    let pos = start;
+    for (const seg of trace.segments) {
+      assert.equal(seg.outputStart, pos, 'segments must be contiguous');
+      assert.ok(seg.outputEnd > seg.outputStart);
+      pos = seg.outputEnd;
+    }
+    assert.equal(pos, start + length, 'segments must cover the whole range');
+  }
+
+  // The root range must recompute the output bytes of the segment.
+  function assertSegmentBytes(res, delta, dictBytes, seg) {
+    const outSlice = res.output.subarray(seg.outputStart, seg.outputEnd);
+    if (seg.kind === 'SOURCE_DICT') {
+      assert.deepEqual(outSlice, dictBytes.subarray(seg.originStart, seg.originEnd));
+    } else if (seg.kind === 'ADD') {
+      assert.deepEqual(outSlice, delta.subarray(seg.originStart, seg.originEnd));
+    } else if (seg.kind === 'RUN') {
+      assert.equal(seg.originEnd, seg.originStart + 1, 'RUN root is a single byte');
+      for (const b of outSlice) assert.equal(b, delta[seg.originStart]);
+    } else {
+      assert.fail(`unexpected segment kind ${seg.kind}`);
+    }
+  }
+
+  test('ADD, RUN and dictionary copies create roots with recomputable bytes', () => {
+    const w = new WindowEncoder('SOURCE', 0, dict.length);
+    w.copy(0, 6); // dict [0,6) -> output [0,6)
+    w.add(te.encode('XY')); // output [6,8)
+    w.run(0x7e, 3); // output [8,11)
+    const delta = assemble(w.build());
+    const res = decodeVcdiff(delta, dict, { trace: { start: 0, length: 11 } });
+    assertTiling(res.trace, 0, 11);
+    assert.equal(res.trace.segments.length, 3);
+    const [s0, s1, s2] = res.trace.segments;
+    const [copyIns, addIns, runIns] = res.windows[0].instructions;
+
+    assert.deepEqual([s0.outputStart, s0.outputEnd], [0, 6]);
+    assert.equal(s0.kind, 'SOURCE_DICT');
+    assert.deepEqual([s0.originStart, s0.originEnd], [0, 6]);
+    assert.equal(s0.codeOffset, copyIns.codeOffset);
+
+    assert.deepEqual([s1.outputStart, s1.outputEnd], [6, 8]);
+    assert.equal(s1.kind, 'ADD');
+    assert.deepEqual(delta.subarray(s1.originStart, s1.originEnd), te.encode('XY'));
+    assert.equal(s1.codeOffset, addIns.codeOffset);
+
+    assert.deepEqual([s2.outputStart, s2.outputEnd], [8, 11]);
+    assert.equal(s2.kind, 'RUN');
+    assert.equal(s2.originEnd, s2.originStart + 1);
+    assert.equal(delta[s2.originStart], 0x7e);
+    assert.equal(s2.codeOffset, runIns.codeOffset);
+  });
+
+  test('a mid-instruction subrange slices the root range precisely', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('abcdef'));
+    const delta = assemble(w.build());
+    const res = decodeVcdiff(delta, new Uint8Array(0), { trace: { start: 2, length: 3 } });
+    assert.equal(res.trace.segments.length, 1);
+    const seg = res.trace.segments[0];
+    assert.deepEqual([seg.outputStart, seg.outputEnd], [2, 5]);
+    assert.equal(seg.kind, 'ADD');
+    assert.deepEqual(delta.subarray(seg.originStart, seg.originEnd), te.encode('cde'));
+  });
+
+  test('copies from prior windows inherit the first producer, never the later COPY', () => {
+    const w1 = new WindowEncoder('SOURCE', 0, dict.length);
+    w1.copy(0, 11); // "0123456789-" -> output [0,11)
+    w1.add(te.encode('WORLD')); // output [11,16)
+    const w2 = new WindowEncoder('TARGET', 5, 11); // source = prior output [5,16)
+    w2.copy(5, 5); // "-WORL" -> output [16,21)
+    w2.copy(10, 1); // "D" -> output [21,22)
+    const delta = assemble(w1.build(), w2.build());
+    const res = decodeVcdiff(delta, dict, { trace: { start: 16, length: 6 } });
+    assertTiling(res.trace, 16, 6);
+
+    const w1copy = res.windows[0].instructions[0];
+    const w1add = res.windows[0].instructions[1];
+    const w2win = res.windows[1];
+    const w2copyOffsets = w2win.instructions.filter((i) => i.op === 'COPY').map((i) => i.codeOffset);
+
+    const segs = res.trace.segments;
+    assert.equal(segs.length, 2);
+    // output[16] <- prior output[10] <- dictionary[10]
+    assert.equal(segs[0].kind, 'SOURCE_DICT');
+    assert.deepEqual([segs[0].outputStart, segs[0].outputEnd], [16, 17]);
+    assert.deepEqual([segs[0].originStart, segs[0].originEnd], [10, 11]);
+    assert.equal(segs[0].codeOffset, w1copy.codeOffset);
+    // output[17..21] <- prior output[11..15] <- the ADD "WORLD" literals
+    assert.equal(segs[1].kind, 'ADD');
+    assert.deepEqual([segs[1].outputStart, segs[1].outputEnd], [17, 22]);
+    assert.deepEqual(delta.subarray(segs[1].originStart, segs[1].originEnd), te.encode('WORLD'));
+    assert.equal(segs[1].codeOffset, w1add.codeOffset);
+    // The root instruction offsets live in window 1, before window 2 begins:
+    // the propagating COPYs of window 2 must not be reported as roots.
+    for (const seg of segs) {
+      assert.ok(seg.codeOffset < w2win.windowOffset, 'root offset must precede window 2');
+      assert.ok(!w2copyOffsets.includes(seg.codeOffset), 'root must not be a later COPY');
+    }
+  });
+
+  test('self-overlapping COPY propagates the original ADD root byte-by-byte', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('ab'));
+    w.copy(0, 10, { mode: 1 }); // HERE: repeat "ab" out to 12 bytes
+    const delta = assemble(w.build());
+    const res = decodeVcdiff(delta, new Uint8Array(0), { trace: { start: 0, length: 12 } });
+    assertTiling(res.trace, 0, 12);
+    const addIns = res.windows[0].instructions[0];
+    // 12 bytes with a 2-byte root period -> six segments, all rooted at the ADD.
+    assert.equal(res.trace.segments.length, 6);
+    for (const seg of res.trace.segments) {
+      assert.equal(seg.kind, 'ADD');
+      assert.equal(seg.codeOffset, addIns.codeOffset);
+      assert.deepEqual(delta.subarray(seg.originStart, seg.originEnd), te.encode('ab'));
+    }
+  });
+
+  test('RUN roots survive being copied across windows (segments merge at the seam)', () => {
+    const w1 = new WindowEncoder('NONE');
+    w1.run(0x51, 4); // "QQQQ" -> output [0,4)
+    const w2 = new WindowEncoder('TARGET', 0, 4);
+    w2.copy(0, 4); // re-emits the run bytes -> output [4,8)
+    const delta = assemble(w1.build(), w2.build());
+    const res = decodeVcdiff(delta, new Uint8Array(0), { trace: { start: 0, length: 8 } });
+    const runIns = res.windows[0].instructions[0];
+    assert.equal(res.trace.segments.length, 1);
+    const seg = res.trace.segments[0];
+    assert.equal(seg.kind, 'RUN');
+    assert.deepEqual([seg.outputStart, seg.outputEnd], [0, 8]);
+    assert.equal(seg.codeOffset, runIns.codeOffset);
+    assert.equal(seg.originEnd, seg.originStart + 1);
+    assert.equal(delta[seg.originStart], 0x51);
+  });
+
+  test('golden vectors: full-output trace tiles the range and recomputes every byte', () => {
+    for (const name of ['plain', 'patterns', 'binary', 'nodict', 'multi', 'near', 'same1']) {
+      const { delta, dict: dictBytes, target } = loadGolden(name);
+      const res = decodeVcdiff(delta, dictBytes, { trace: { start: 0, length: target.length } });
+      assertTiling(res.trace, 0, target.length);
+      const offsets = new Set();
+      for (const w of res.windows) for (const ins of w.instructions) offsets.add(ins.codeOffset);
+      for (const seg of res.trace.segments) {
+        assertSegmentBytes(res, delta, dictBytes, seg);
+        assert.ok(
+          offsets.has(seg.codeOffset),
+          `${name}: codeOffset ${seg.codeOffset} is not a real instruction offset`,
+        );
+      }
+    }
+  });
+
+  test('trace range validation rejects the request (no partial answer)', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('abc'));
+    const delta = assemble(w.build());
+    const bad = [
+      [{ start: 0, length: 0 }, 'TRACE_RANGE'],
+      [{ start: 0, length: -2 }, 'TRACE_RANGE'],
+      [{ start: -1, length: 2 }, 'TRACE_RANGE'],
+      [{ start: 1.5, length: 2 }, 'TRACE_NOT_INTEGER'],
+      [{ start: 0, length: 1.5 }, 'TRACE_NOT_INTEGER'],
+      [{ start: '0', length: 2 }, 'TRACE_NOT_INTEGER'],
+      [{ start: 0, length: 4 }, 'TRACE_RANGE'], // beyond the 3 decoded bytes
+      [{ start: 3, length: 1 }, 'TRACE_RANGE'],
+      [{ start: 2, length: 2 }, 'TRACE_RANGE'],
+    ];
+    for (const [trace, code] of bad) {
+      let caught;
+      try {
+        decodeVcdiff(delta, new Uint8Array(0), { trace });
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught instanceof VcdiffError, `expected rejection for ${JSON.stringify(trace)}`);
+      assert.equal(caught.code, code, `code mismatch for ${JSON.stringify(trace)}: ${caught.code}`);
+      assert.equal(caught.offset, null, 'trace errors are not tied to a delta offset');
+    }
+  });
+
+  test('requests without a trace range keep the original result shape', () => {
+    const w = new WindowEncoder('NONE');
+    w.add(te.encode('abc'));
+    const res = decodeVcdiff(assemble(w.build()));
+    assert.ok(!('trace' in res));
+    assert.equal(res.length, 3);
+    assert.equal(res.windows.length, 1);
+    assert.deepEqual(res.windows[0].instructions.map((i) => i.op), ['ADD']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // helpers for crafted corruptions
 // ---------------------------------------------------------------------------
 

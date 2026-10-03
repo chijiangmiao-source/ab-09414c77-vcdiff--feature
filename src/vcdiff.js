@@ -33,6 +33,18 @@ export const ADDRESS_MODES = DEFAULT_NEAR + DEFAULT_SAME + 2; // 9
 export const MAX_OUTPUT_BYTES = 512 * 1024;
 export const MAX_WINDOWS = 8;
 
+// Provenance root kinds attached to every output byte. ADD and RUN create
+// fresh roots (their bytes live in the delta's data section); SOURCE_DICT
+// roots point into the dictionary; COPY instructions never create roots —
+// they propagate the label of the byte they read, so a later COPY's own
+// position is never mistaken for the origin.
+export const PROV_NONE = 0;
+export const PROV_SOURCE_DICT = 1;
+export const PROV_ADD = 2;
+export const PROV_RUN = 3;
+
+export const PROV_KIND_NAMES = ['NONE', 'SOURCE_DICT', 'ADD', 'RUN'];
+
 export class VcdiffError extends Error {
   constructor(code, message, offset = null) {
     super(message);
@@ -194,6 +206,42 @@ class AddressCache {
 // Decoder
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Provenance trace: collapse the per-byte labels over [start, start+length)
+// into maximal contiguous segments. Adjacent bytes merge when they share the
+// root kind and the first-producing instruction, and their root positions
+// continue smoothly (RUN bytes all point at the same data-section byte).
+// ---------------------------------------------------------------------------
+
+function buildTraceSegments(provKind, provOrigin, provCode, start, length) {
+  const end = start + length;
+  const segments = [];
+  let i = start;
+  while (i < end) {
+    const kind = provKind[i];
+    const origin = provOrigin[i];
+    const code = provCode[i];
+    let j = i + 1;
+    while (j < end && provKind[j] === kind && provCode[j] === code) {
+      const continues = kind === PROV_RUN
+        ? provOrigin[j] === origin
+        : provOrigin[j] === origin + (j - i);
+      if (!continues) break;
+      j += 1;
+    }
+    segments.push({
+      outputStart: i,
+      outputEnd: j,
+      kind: PROV_KIND_NAMES[kind],
+      originStart: origin,
+      originEnd: kind === PROV_RUN ? origin + 1 : origin + (j - i),
+      codeOffset: code,
+    });
+    i = j;
+  }
+  return segments;
+}
+
 export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}) {
   const maxOutput = options.maxOutput ?? MAX_OUTPUT_BYTES;
   const maxWindows = options.maxWindows ?? MAX_WINDOWS;
@@ -204,6 +252,28 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
   }
   if (!(dictionary instanceof Uint8Array)) {
     throw new VcdiffError('BAD_INPUT', 'dictionary must be a byte array');
+  }
+
+  // Optional provenance trace over the final output: { start, length }.
+  // Shape checks that do not need the decoded length happen up front so a
+  // malformed trace request rejects the whole decode before any work.
+  const traceReq = options.trace ?? null;
+  if (traceReq !== null) {
+    if (typeof traceReq !== 'object') {
+      throw new VcdiffError('BAD_TRACE', 'trace must be an object with start and length');
+    }
+    if (!Number.isInteger(traceReq.start) || !Number.isInteger(traceReq.length)) {
+      throw new VcdiffError(
+        'TRACE_NOT_INTEGER',
+        'trace start and length must be integers',
+      );
+    }
+    if (traceReq.start < 0 || traceReq.length <= 0) {
+      throw new VcdiffError(
+        'TRACE_RANGE',
+        'trace start must be >= 0 and trace length must be > 0',
+      );
+    }
   }
 
   const r = new Cursor(delta, 0, delta.length);
@@ -246,6 +316,14 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
   // Output buffer shared by all windows; discarded by the caller on failure.
   const output = new Uint8Array(maxOutput);
   let outputLen = 0;
+  // Per-output-byte provenance labels, written alongside `output` by every
+  // instruction. provKind: PROV_* root kind; provOrigin: root byte position
+  // (dictionary offset for SOURCE_DICT, raw delta data-section offset for
+  // ADD/RUN); provCode: raw offset of the instruction that first produced
+  // the byte. COPY inherits all three from the byte it reads.
+  const provKind = new Uint8Array(maxOutput);
+  const provOrigin = new Uint32Array(maxOutput);
+  const provCode = new Uint32Array(maxOutput);
   const windows = [];
 
   // --- Windows ------------------------------------------------------------
@@ -475,9 +553,16 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
             codeOffset,
           );
         }
+        const addDataOffset = dcur.pos; // raw delta offset of the literal bytes
         const addData = delta.slice(dcur.pos, dcur.pos + size);
         dcur.pos += size;
-        output.set(addData, windowOutputStart + generated);
+        const outBase = windowOutputStart + generated;
+        output.set(addData, outBase);
+        for (let i = 0; i < size; i++) {
+          provKind[outBase + i] = PROV_ADD;
+          provOrigin[outBase + i] = addDataOffset + i;
+          provCode[outBase + i] = codeOffset;
+        }
         generated += size;
         instructions.push({
           seq: order,
@@ -495,8 +580,15 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
             codeOffset,
           );
         }
+        const runByteOffset = dcur.pos; // raw delta offset of the repeated byte
         const runByte = dcur.byte();
-        output.fill(runByte, windowOutputStart + generated, windowOutputStart + generated + size);
+        const outBase = windowOutputStart + generated;
+        output.fill(runByte, outBase, outBase + size);
+        for (let i = 0; i < size; i++) {
+          provKind[outBase + i] = PROV_RUN;
+          provOrigin[outBase + i] = runByteOffset;
+          provCode[outBase + i] = codeOffset;
+        }
         generated += size;
         instructions.push({
           seq: order,
@@ -522,11 +614,26 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
           address - sourceLength < generated;
         // Byte-by-byte copy. A byte is legal when it lies in the source
         // segment or has already been generated in this target window.
+        // Every copied byte inherits the provenance label of the byte it
+        // reads; only a read from a SOURCE (dictionary) segment creates a
+        // fresh root, stamped with this COPY's raw offset.
         for (let i = 0; i < size; i++) {
           const u = address + i;
           let value;
+          const dst = windowOutputStart + generated;
           if (u < sourceLength) {
             value = source[u];
+            if (sourceKind === 'TARGET') {
+              // Prior-window output: propagate the existing root label.
+              const srcPos = sourcePosition + u;
+              provKind[dst] = provKind[srcPos];
+              provOrigin[dst] = provOrigin[srcPos];
+              provCode[dst] = provCode[srcPos];
+            } else {
+              provKind[dst] = PROV_SOURCE_DICT;
+              provOrigin[dst] = sourcePosition + u;
+              provCode[dst] = codeOffset;
+            }
           } else {
             const targetIndex = u - sourceLength;
             if (targetIndex < 0 || targetIndex >= generated) {
@@ -537,9 +644,15 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
                 codeOffset,
               );
             }
-            value = output[windowOutputStart + targetIndex];
+            // Current-window bytes (including self-overlap reads of bytes
+            // written earlier in this loop) carry their labels with them.
+            const srcPos = windowOutputStart + targetIndex;
+            value = output[srcPos];
+            provKind[dst] = provKind[srcPos];
+            provOrigin[dst] = provOrigin[srcPos];
+            provCode[dst] = provCode[srcPos];
           }
-          output[windowOutputStart + generated] = value;
+          output[dst] = value;
           generated += 1;
         }
         instructions.push({
@@ -636,10 +749,30 @@ export function decodeVcdiff(delta, dictionary = new Uint8Array(0), options = {}
     r.pos = deltaEnd;
   }
 
-  return {
+  // A requested trace range is validated against the final output length;
+  // an out-of-bounds range rejects the whole request (no partial answer).
+  let trace = null;
+  if (traceReq !== null) {
+    const { start, length } = traceReq;
+    if (start > outputLen || length > outputLen - start) {
+      throw new VcdiffError(
+        'TRACE_RANGE',
+        `trace range [${start}, +${length}) lies outside the ${outputLen} decoded bytes`,
+      );
+    }
+    trace = {
+      start,
+      length,
+      segments: buildTraceSegments(provKind, provOrigin, provCode, start, length),
+    };
+  }
+
+  const result = {
     output: output.slice(0, outputLen),
     length: outputLen,
     windows,
     truncated: false,
   };
+  if (trace !== null) result.trace = trace;
+  return result;
 }

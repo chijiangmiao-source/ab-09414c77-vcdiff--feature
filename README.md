@@ -7,8 +7,38 @@
 - 每个窗口的源区间（SOURCE 基准字典 / TARGET 前序窗口输出 / 无源段）；
 - 按指令顺序列出的 ADD、RUN、COPY 证据（尺寸、数据 hex、地址模式、U 空间地址、
   解析后的实际指向区间、原始偏移）；
+- 可选的**根源追溯**：填写目标起始位置与长度后，返回该区间每个字节的连续根源片段
+  （最终输出范围 / 根源类型 / 根源字节范围 / 首次产生它的指令原始偏移）；
 - 失败时给出错误码与**首个原始偏移**，且不保留任何部分输出；
 - 可一键清空输入与结论。
+
+## 根源追溯（provenance trace）
+
+解码器在生成每个输出字节时同步维护可复算的根源标签：
+
+| 指令 | 标签行为 |
+| --- | --- |
+| ADD | 新根源：类型 `ADD`，根源位置为字面字节在 Delta 数据段的原始偏移 |
+| RUN | 新根源：类型 `RUN`，根源位置为重复字节在 Delta 数据段的原始偏移（单字节） |
+| SOURCE 窗口 COPY | 新根源：类型 `SOURCE_DICT`，根源位置为基准字典偏移，指令偏移为该 COPY 自身 |
+| TARGET 窗口 COPY（前序窗口） | **继承**被读字节的既有标签，不产生新根源 |
+| 当前窗口 COPY（含自重叠） | **继承**被读字节的既有标签，逐字节传递 |
+
+因此后续 COPY 的指令位置永远不会被误当作根源：跨窗口复制、自重叠复制都只是
+“传递”既有标签。请求追溯范围 `[start, start+length)` 后，解码器把该区间内
+相邻且根源连续（同类型、同首次指令、根源位置相接；RUN 为同一字节）的标签合并为
+连续片段返回。每段包含：
+
+- `outputStart` / `outputEnd`：最终输出范围（半开区间）；
+- `kind`：`SOURCE_DICT` / `ADD` / `RUN`；
+- `originStart` / `originEnd`：根源字节范围（`SOURCE_DICT` 为字典偏移，
+  `ADD`/`RUN` 为 Delta 数据段原始偏移；`RUN` 恒为单字节）；
+- `codeOffset`：首次产生该字节的指令在原始增量中的偏移。
+
+追溯范围校验：起始位置与长度必须为整数、长度 > 0、区间不得越出最终输出
+（`[0, length)`）；违反时整个请求以 `400` 拒绝（`TRACE_NOT_INTEGER` /
+`TRACE_RANGE`），不返回任何结论，页面同步清除旧结果。未填写追溯范围的请求
+保持原有响应结构（无 `trace` 字段）。
 
 ## 严格接受规则（RFC 3284）
 
@@ -79,6 +109,12 @@ echo "exit=$?"
 { "deltaBase64": "1sPExAAAAA...", "dictionaryBase64": "" }
 ```
 
+可选追溯字段（必须成对出现，均为整数）：
+
+```json
+{ "deltaBase64": "1sPExAAAAA...", "dictionaryBase64": "", "traceStart": 24, "traceLength": 13 }
+```
+
 成功 `200`：
 
 ```json
@@ -104,10 +140,30 @@ echo "exit=$?"
 }
 ```
 
+携带追溯范围时，响应额外包含 `trace`（未携带时无此字段，结构不变）：
+
+```json
+{
+  "trace": {
+    "start": 24,
+    "length": 13,
+    "segments": [
+      { "outputStart": 24, "outputEnd": 25, "kind": "SOURCE_DICT",
+        "originStart": 10, "originEnd": 11, "codeOffset": 20 },
+      { "outputStart": 25, "outputEnd": 30, "kind": "ADD",
+        "originStart": 14, "originEnd": 19, "codeOffset": 21 }
+    ]
+  }
+}
+```
+
 失败 `400/413`：
 
 ```json
 { "ok": false, "error": { "code": "COPY_NOT_GENERATED", "message": "…", "offset": 39 } }
 ```
+
+追溯范围非法（非整数 / 长度为零 / 越界）时同样返回 `400`，`error.code` 为
+`TRACE_NOT_INTEGER` 或 `TRACE_RANGE`，`offset` 为 `null`，且不返回任何结论。
 
 另有 `GET /healthz → {"status":"ok"}` 与 `POST /api/reset → {"ok":true}`。

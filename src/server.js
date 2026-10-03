@@ -71,7 +71,7 @@ export function handleDecode(rawBody) {
     throw new VcdiffError('BAD_REQUEST', 'request body must be a JSON object');
   }
 
-  const { deltaBase64, dictionaryBase64 } = parsed;
+  const { deltaBase64, dictionaryBase64, traceStart, traceLength } = parsed;
   if (typeof deltaBase64 !== 'string') {
     throw new VcdiffError('BAD_REQUEST', 'field "deltaBase64" is required');
   }
@@ -89,15 +89,31 @@ export function handleDecode(rawBody) {
     );
   }
 
+  // Optional provenance trace over the final output. Both fields must be
+  // present together; integer/range validation happens in the decoder so a
+  // bad trace range rejects the whole request.
+  let trace = null;
+  const hasStart = traceStart !== undefined && traceStart !== null;
+  const hasLength = traceLength !== undefined && traceLength !== null;
+  if (hasStart || hasLength) {
+    if (!hasStart || !hasLength) {
+      throw new VcdiffError(
+        'BAD_REQUEST',
+        'fields "traceStart" and "traceLength" must be supplied together',
+      );
+    }
+    trace = { start: traceStart, length: traceLength };
+  }
+
   const delta = decodeBase64Field(deltaBase64, 'deltaBase64');
   const dictionary = decodeBase64Field(dictText, 'dictionaryBase64');
 
   // The decoder either returns the complete output, or throws; on failure no
   // partial output leaves this function.
-  const result = decodeVcdiff(delta, dictionary);
+  const result = decodeVcdiff(delta, dictionary, trace ? { trace } : {});
 
   const sha256 = createHash('sha256').update(result.output).digest('hex');
-  return {
+  const body = {
     ok: true,
     length: result.length,
     sha256,
@@ -113,6 +129,10 @@ export function handleDecode(rawBody) {
     })),
     limits: { maxOutputBytes: MAX_OUTPUT_BYTES, maxWindows: MAX_WINDOWS },
   };
+  // Only present when the caller asked for a provenance trace; requests
+  // without one keep the original response shape.
+  if (result.trace) body.trace = result.trace;
+  return body;
 }
 
 export function createApp() {

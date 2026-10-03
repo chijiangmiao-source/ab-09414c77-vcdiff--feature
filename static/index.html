@@ -28,6 +28,12 @@
     font-size: 12px; word-break: break-all; }
   textarea:focus { outline: none; border-color: var(--accent); }
   textarea.over { border-color: var(--err); }
+  .trace-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .trace-row label.field { margin-bottom: 14px; }
+  input.num { width: 100%; background: #0d1226; color: var(--txt); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; font-family: var(--mono); font-size: 12.5px; }
+  input.num:focus { outline: none; border-color: var(--accent); }
+  input.num.over { border-color: var(--err); }
   .btns { display: flex; gap: 10px; margin-top: 4px; }
   button { border: 0; border-radius: 7px; padding: 9px 18px; font-size: 13.5px; cursor: pointer; }
   button.primary { background: var(--accent); color: #0b1020; font-weight: 600; }
@@ -73,7 +79,7 @@
 <body>
 <header>
   <h1>深空归档 · 增量标定片导入校验台</h1>
-  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据。解码失败时报告首个原始偏移且不保留任何部分输出。</p>
+  <p>粘贴 Base64 VCDIFF 载荷与基准字典，按 RFC 3284 默认码表解码，核验最终长度 / SHA-256 / 窗口源区间 / 指令证据；可附加目标区间追溯每个字节的连续根源（基准字典 / ADD / RUN，COPY 仅传递既有根源）。解码失败时报告首个原始偏移且不保留任何部分输出。</p>
 </header>
 
 <main>
@@ -88,6 +94,18 @@
         <span class="lbl"><span>Base64 基准字典（≤ 64 KiB，可留空）</span><span id="dictCount">0 B</span></span>
         <textarea id="dict" spellcheck="false" placeholder="SOURCE 窗口使用的基准字典字节的 Base64" autocomplete="off"></textarea>
       </label>
+      <div class="trace-row">
+        <label class="field">
+          <span class="lbl"><span>根源追溯：目标起始位置（可选）</span></span>
+          <input id="traceStart" class="num" type="text" inputmode="numeric" autocomplete="off"
+            placeholder="留空则不追溯">
+        </label>
+        <label class="field">
+          <span class="lbl"><span>根源追溯：长度（可选）</span></span>
+          <input id="traceLength" class="num" type="text" inputmode="numeric" autocomplete="off"
+            placeholder="正整数，越界将拒绝">
+        </label>
+      </div>
       <div class="btns">
         <button type="submit" class="primary" id="submitBtn">提交真实接口校验</button>
         <button type="button" class="ghost" id="clearBtn">清空输入与结论</button>
@@ -99,12 +117,13 @@
       <li>整数必须最短编码；三段长度须精确吻合</li>
       <li>COPY 仅允许读取 SOURCE / 前序 TARGET 或当前窗口已生成字节</li>
       <li>地址缓存按窗口维护：<code>SELF / HERE / NEAR×4 / SAME×3</code></li>
+      <li>填写追溯范围后，返回该区间每个字节的连续根源片段（基准字典 / ADD / RUN，含首次指令原始偏移）；越界、长度为零或非整数将拒绝本次请求</li>
     </ul>
   </section>
 
   <section class="card" id="resultcard">
     <h2>接口结论</h2>
-    <div id="result"><div class="placeholder">尚未提交。校验结果、窗口源区间与 ADD / RUN / COPY 证据将在此按指令顺序列出。</div></div>
+    <div id="result"><div class="placeholder">尚未提交。校验结果、窗口源区间、ADD / RUN / COPY 证据与可选的根源追溯片段将在此列出。</div></div>
   </section>
 </main>
 
@@ -112,6 +131,7 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const deltaEl = $('delta'), dictEl = $('dict');
+const traceStartEl = $('traceStart'), traceLengthEl = $('traceLength');
 const deltaCount = $('deltaCount'), dictCount = $('dictCount');
 
 const DELTA_LIMIT = 128 * 1024;
@@ -194,6 +214,7 @@ function renderWindow(w) {
 
 function renderOk(data) {
   const winHtml = data.windows.map(renderWindow).join('');
+  const traceHtml = data.trace ? renderTrace(data.trace) : '';
   return `
   <div class="alert ok">✓ 解码成功：全部 ${data.windows.length} 个窗口已校验，所有 COPY 地址均未越界。输出 ${data.length.toLocaleString('en')} 字节（上限 ${data.limits.maxOutputBytes.toLocaleString('en')}）。</div>
   <div class="summary">
@@ -201,6 +222,7 @@ function renderOk(data) {
     <div class="stat"><div class="k">窗口数量</div><div class="v">${data.windows.length} / ${data.limits.maxWindows}</div></div>
     <div class="stat"><div class="k">SHA-256</div><div class="v" style="font-size:11.5px">${esc(data.sha256)}</div></div>
   </div>
+  ${traceHtml}
   ${winHtml}`;
 }
 
@@ -212,6 +234,58 @@ function renderError(payload) {
   <div class="alert error">
     <div style="margin-bottom:6px">✗ <span class="code">${esc(e.code || 'ERROR')}</span> — ${esc(e.message || '解码失败')}</div>
     <div>${off} <span class="muted">已中止解码，未保留任何部分输出。</span></div>
+  </div>`;
+}
+
+// 拒绝本次请求并清除旧结论（结果区只保留本次错误）。
+function rejectRequest(code, message) {
+  $('result').innerHTML = `
+  <div class="alert error">
+    <div style="margin-bottom:6px">✗ <span class="code">${esc(code)}</span> — ${esc(message)}</div>
+    <div><span class="muted">本次请求已被拒绝，旧结论已清除。</span></div>
+  </div>`;
+}
+
+const TRACE_KIND_LABEL = {
+  SOURCE_DICT: ['基准字典 SOURCE_DICT', 'SOURCE_DICT'],
+  ADD: ['字面数据 ADD', 'ADD'],
+  RUN: ['重复字节 RUN', 'RUN'],
+};
+
+function renderTrace(trace) {
+  const rows = trace.segments.map((s) => {
+    const [label, cls] = TRACE_KIND_LABEL[s.kind] || [s.kind, 'NONE'];
+    let origin;
+    if (s.kind === 'SOURCE_DICT') {
+      origin = `基准字典 <span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+    } else if (s.kind === 'ADD') {
+      origin = `Delta 数据段 <span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+    } else if (s.kind === 'RUN') {
+      origin = `Delta 数据段重复字节 <span class="hex">@${s.originStart}</span>`;
+    } else {
+      origin = `<span class="hex">[${s.originStart}, ${s.originEnd})</span>`;
+    }
+    return `<tr>
+      <td class="num">[${s.outputStart}, ${s.outputEnd})</td>
+      <td class="num">${s.outputEnd - s.outputStart}</td>
+      <td>${tag(label, cls)}</td>
+      <td>${origin}</td>
+      <td class="num">${s.codeOffset}</td>
+    </tr>`;
+  }).join('');
+  return `
+  <div class="window">
+    <div class="wh">
+      <span><b>根源追溯</b></span>
+      <span>最终输出区间 <span class="hex">[${trace.start}, ${trace.start + trace.length})</span> · ${trace.length} B</span>
+      <span class="muted">连续根源片段 ${trace.segments.length} 段；指令偏移为首次产生该字节的指令在原始增量中的位置</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>最终输出范围</th><th>长度</th><th>根源类型</th><th>根源字节范围</th><th>首次指令原始偏移</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
   </div>`;
 }
 
@@ -230,6 +304,38 @@ $('form').addEventListener('submit', async (ev) => {
     return;
   }
 
+  // 可选的根源追溯范围：两项必须同时填写；非整数、负数或零长度在提交前
+  // 即拒绝本次请求并清除旧结论（越界由服务端判定，同样拒绝）。
+  const tsRaw = traceStartEl.value.trim();
+  const tlRaw = traceLengthEl.value.trim();
+  let traceStart = null, traceLength = null;
+  if (tsRaw !== '' || tlRaw !== '') {
+    if (tsRaw === '' || tlRaw === '') {
+      rejectRequest('BAD_REQUEST', '追溯范围需同时填写起始位置与长度，或两项全部留空。');
+      return;
+    }
+    if (!/^\d+$/.test(tsRaw) || !/^\d+$/.test(tlRaw)) {
+      rejectRequest('TRACE_NOT_INTEGER', '追溯起始位置与长度必须是非负整数。');
+      return;
+    }
+    traceStart = Number(tsRaw);
+    traceLength = Number(tlRaw);
+    if (!Number.isSafeInteger(traceStart) || !Number.isSafeInteger(traceLength)) {
+      rejectRequest('TRACE_NOT_INTEGER', '追溯起始位置与长度超出可表示的整数范围。');
+      return;
+    }
+    if (traceLength <= 0) {
+      rejectRequest('TRACE_RANGE', '追溯长度必须大于 0。');
+      return;
+    }
+  }
+
+  const payload = { deltaBase64: deltaB64, dictionaryBase64: dictB64 };
+  if (traceStart !== null) {
+    payload.traceStart = traceStart;
+    payload.traceLength = traceLength;
+  }
+
   btn.disabled = true;
   btn.textContent = '校验中…';
   $('result').innerHTML = '<div class="placeholder">正在调用 /api/decode …</div>';
@@ -237,7 +343,7 @@ $('form').addEventListener('submit', async (ev) => {
     const resp = await fetch('/api/decode', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ deltaBase64: deltaB64, dictionaryBase64: dictB64 }),
+      body: JSON.stringify(payload),
     });
     const data = await resp.json();
     $('result').innerHTML = data.ok ? renderOk(data) : renderError(data);
@@ -253,6 +359,8 @@ $('form').addEventListener('submit', async (ev) => {
 $('clearBtn').addEventListener('click', async () => {
   deltaEl.value = '';
   dictEl.value = '';
+  traceStartEl.value = '';
+  traceLengthEl.value = '';
   updateCounter(deltaEl, deltaCount, DELTA_LIMIT);
   updateCounter(dictEl, dictCount, DICT_LIMIT);
   $('result').innerHTML = '<div class="placeholder">输入与结论均已清空。</div>';

@@ -149,6 +149,125 @@ describe('HTTP surface', () => {
     assert.equal((await resp.json()).error.code, 'PAYLOAD_TOO_LARGE');
   });
 
+  test('POST /api/decode with a trace range returns contiguous provenance segments', async () => {
+    const resp = await post('/api/decode', {
+      deltaBase64: sample.valid.deltaBase64,
+      dictionaryBase64: sample.dictionaryBase64,
+      traceStart: 24,
+      traceLength: 13,
+    });
+    assert.equal(resp.status, 200);
+    const data = await resp.json();
+    assert.equal(data.ok, true);
+    assert.ok(data.trace, 'trace must be present when requested');
+    assert.equal(data.trace.start, 24);
+    assert.equal(data.trace.length, 13);
+
+    // Segments tile [24, 37) exactly and carry all required fields.
+    let pos = 24;
+    for (const seg of data.trace.segments) {
+      assert.equal(seg.outputStart, pos, 'segments must be contiguous');
+      assert.ok(seg.outputEnd > seg.outputStart);
+      pos = seg.outputEnd;
+      assert.ok(['SOURCE_DICT', 'ADD', 'RUN'].includes(seg.kind));
+      assert.ok(seg.originEnd > seg.originStart);
+      assert.ok(Number.isInteger(seg.codeOffset));
+    }
+    assert.equal(pos, 37);
+
+    // Window 2 only re-emits earlier bytes through COPY: every root offset
+    // must belong to the instruction that first produced the byte, never to
+    // one of window 2's propagating COPYs.
+    const w2copyOffsets = new Set(
+      data.windows[1].instructions.filter((i) => i.op === 'COPY').map((i) => i.codeOffset),
+    );
+    assert.ok(w2copyOffsets.size > 0);
+    for (const seg of data.trace.segments) {
+      assert.ok(!w2copyOffsets.has(seg.codeOffset), 'segment root must not be a later COPY');
+    }
+
+    // Expected layout of the sample over [24, 37):
+    //   [24,25) dict '-' -> [25,30) ADD "WORLD" -> [30,32) ADD ">>"
+    //   -> [32,33) dict '-' -> [33,37) ADD "WORL"
+    const segs = data.trace.segments;
+    assert.equal(segs.length, 5);
+    const w1copy = data.windows[0].instructions[0];
+    const w1add = data.windows[0].instructions[1];
+    const w2add = data.windows[1].instructions[2];
+
+    assert.equal(segs[0].kind, 'SOURCE_DICT');
+    assert.deepEqual([segs[0].outputStart, segs[0].outputEnd], [24, 25]);
+    assert.deepEqual([segs[0].originStart, segs[0].originEnd], [10, 11]);
+    assert.equal(segs[0].codeOffset, w1copy.codeOffset);
+    const dict = Buffer.from(sample.dictionaryBase64, 'base64');
+    assert.equal(dict.subarray(10, 11).toString(), '-');
+
+    assert.equal(segs[1].kind, 'ADD');
+    assert.deepEqual([segs[1].outputStart, segs[1].outputEnd], [25, 30]);
+    assert.equal(segs[1].codeOffset, w1add.codeOffset);
+
+    assert.equal(segs[2].kind, 'ADD');
+    assert.deepEqual([segs[2].outputStart, segs[2].outputEnd], [30, 32]);
+    assert.equal(segs[2].codeOffset, w2add.codeOffset);
+
+    assert.equal(segs[3].kind, 'SOURCE_DICT');
+    assert.deepEqual([segs[3].outputStart, segs[3].outputEnd], [32, 33]);
+    assert.deepEqual([segs[3].originStart, segs[3].originEnd], [10, 11]);
+    assert.equal(segs[3].codeOffset, w1copy.codeOffset);
+
+    assert.equal(segs[4].kind, 'ADD');
+    assert.deepEqual([segs[4].outputStart, segs[4].outputEnd], [33, 37]);
+    assert.equal(segs[4].codeOffset, w1add.codeOffset);
+  });
+
+  test('trace range rejections return 400 and retain no conclusions', async () => {
+    const cases = [
+      [{ traceStart: 0, traceLength: 0 }, 'TRACE_RANGE'],
+      [{ traceStart: -1, traceLength: 3 }, 'TRACE_RANGE'],
+      [{ traceStart: 1.5, traceLength: 3 }, 'TRACE_NOT_INTEGER'],
+      [{ traceStart: 0, traceLength: 2.5 }, 'TRACE_NOT_INTEGER'],
+      [{ traceStart: '24', traceLength: 13 }, 'TRACE_NOT_INTEGER'],
+      [{ traceStart: 36, traceLength: 2 }, 'TRACE_RANGE'], // 36+2 > 37 decoded bytes
+      [{ traceStart: 37, traceLength: 1 }, 'TRACE_RANGE'],
+      [{ traceStart: 0, traceLength: 1024 }, 'TRACE_RANGE'],
+    ];
+    for (const [extra, code] of cases) {
+      const resp = await post('/api/decode', {
+        deltaBase64: sample.valid.deltaBase64,
+        dictionaryBase64: sample.dictionaryBase64,
+        ...extra,
+      });
+      assert.equal(resp.status, 400, `${JSON.stringify(extra)} must be rejected`);
+      const data = await resp.json();
+      assert.equal(data.ok, false);
+      assert.equal(data.error.code, code, `${JSON.stringify(extra)}: ${data.error.code}`);
+      assert.ok(!('windows' in data) && !('trace' in data), 'rejection keeps no conclusions');
+    }
+  });
+
+  test('a lone traceStart without traceLength is rejected', async () => {
+    const resp = await post('/api/decode', {
+      deltaBase64: sample.valid.deltaBase64,
+      dictionaryBase64: sample.dictionaryBase64,
+      traceStart: 24,
+    });
+    assert.equal(resp.status, 400);
+    assert.equal((await resp.json()).error.code, 'BAD_REQUEST');
+  });
+
+  test('requests without a trace range keep the original response shape', async () => {
+    const resp = await post('/api/decode', {
+      deltaBase64: sample.valid.deltaBase64,
+      dictionaryBase64: sample.dictionaryBase64,
+    });
+    const data = await resp.json();
+    assert.equal(data.ok, true);
+    assert.ok(!('trace' in data), 'no trace key unless requested');
+    assert.equal(data.length, sample.valid.expectedLength);
+    assert.equal(data.sha256, sample.valid.expectedSha256);
+    assert.equal(data.windows.length, 2);
+  });
+
   test('POST /api/reset acknowledges and a following decode still works', async () => {
     const r = await post('/api/reset', {});
     assert.equal(r.status, 200);
